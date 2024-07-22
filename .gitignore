@@ -20,5 +20,7 @@
 # Go workspace file
 go.work
 go.work.sum
-#local testing files
+# local testing files
 examples/
+# mac stuff
+*.DS_Store
