@@ -13,8 +13,14 @@ const (
 	MethodTrace   = "TRACE"
 )
 
-// HTTP status codes for default handlers
+// HTTP status codes
 const (
-	StatusNotFound         = 404
-	StatusMethodNotAllowed = 405
+	StatusOK                  = 200
+	StatusCreated             = 201
+	StatusBadRequest          = 400
+	StatusUnauthorized        = 401
+	StatusForbidden           = 403
+	StatusNotFound            = 404
+	StatusMethodNotAllowed    = 405
+	StatusInternalServerError = 500
 )
