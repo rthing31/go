@@ -104,8 +104,8 @@ func (r *Router) SetMethodNotAllowedHandler(handler Handler) {
 
 // HandleRequest routes the incoming request to the appropriate handler
 func (r *Router) HandleRequest(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
-	handler := r.createHandlerChain(r.preMiddleware, HandlerFunc(r.handleRouteRequest), request)
-	handler = r.createHandlerChain(r.postMiddleware, handler, request)
+	handler := r.createHandlerChain(r.preMiddleware, HandlerFunc(r.handleRouteRequest))
+	handler = r.createHandlerChain(r.postMiddleware, handler)
 	return handler.HandleRequest(ctx, request)
 }
 
@@ -121,16 +121,16 @@ func (r *Router) handleRouteRequest(ctx context.Context, request events.LambdaFu
 }
 
 // createHandlerChain creates a chain of middleware and handlers, considering exclusions
-func (r *Router) createHandlerChain(middleware []Middleware, finalHandler Handler, request events.LambdaFunctionURLRequest) Handler {
+func (r *Router) createHandlerChain(middleware []Middleware, finalHandler Handler) Handler {
 	if len(middleware) == 0 {
 		return finalHandler
 	}
 
-	return HandlerFunc(func(ctx context.Context, req events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
-		if r.shouldApplyMiddleware(middleware[0], req) {
-			return middleware[0].Process(ctx, req, r.createHandlerChain(middleware[1:], finalHandler, req))
+	return HandlerFunc(func(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
+		if r.shouldApplyMiddleware(middleware[0], request) {
+			return middleware[0].Process(ctx, request, r.createHandlerChain(middleware[1:], finalHandler))
 		}
-		return r.createHandlerChain(middleware[1:], finalHandler, req).HandleRequest(ctx, req)
+		return r.createHandlerChain(middleware[1:], finalHandler).HandleRequest(ctx, request)
 	})
 }
 
