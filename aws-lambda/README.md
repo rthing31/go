@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net/http"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
@@ -18,54 +17,69 @@ func main() {
 	r := router.NewRouter()
 
 	// Add middleware
-	r.UsePre(router.MiddlewareFunc(loggerMiddleware))
-	r.UsePost(router.MiddlewareFunc(headerMiddleware))
+	r.UsePre(loggingMiddleware())
+	r.UsePre(authMiddleware())
 
 	// Add routes
 	r.AddRoute(router.MethodGet, "/hello", router.HandlerFunc(helloHandler))
-	r.AddRoute(router.MethodPost, "/echo", router.HandlerFunc(echoHandler))
+	r.AddRoute(router.MethodPost, "/users", router.HandlerFunc(createUserHandler))
 
-	// Set custom Not Found handler
+	// Set custom not found handler
 	r.SetNotFoundHandler(router.HandlerFunc(customNotFoundHandler))
 
-	// For AWS Lambda
+	// Start the Lambda handler
 	lambda.Start(r.HandleRequest)
 }
 
-func loggerMiddleware(ctx context.Context, request events.LambdaFunctionURLRequest, next router.Handler) (events.LambdaFunctionURLResponse, error) {
-	log.Printf("Request: %s %s", request.RequestContext.HTTP.Method, request.RequestContext.HTTP.Path)
-	return next.HandleRequest(ctx, request)
+func loggingMiddleware() router.Middleware {
+	return router.NewMiddleware(
+		func(ctx context.Context, request events.LambdaFunctionURLRequest, next router.Handler) (events.LambdaFunctionURLResponse, error) {
+			log.Printf("Request: %s %s", request.RequestContext.HTTP.Method, request.RequestContext.HTTP.Path)
+			return next.HandleRequest(ctx, request)
+		},
+		nil, // No exclusions
+	)
 }
 
-func headerMiddleware(ctx context.Context, request events.LambdaFunctionURLRequest, next router.Handler) (events.LambdaFunctionURLResponse, error) {
-	resp, err := next.HandleRequest(ctx, request)
-	if err == nil {
-		if resp.Headers == nil {
-			resp.Headers = make(map[string]string)
-		}
-		resp.Headers["X-Custom-Header"] = "SomeValue"
-	}
-	return resp, err
+func authMiddleware() router.Middleware {
+	return router.NewMiddleware(
+		func(ctx context.Context, request events.LambdaFunctionURLRequest, next router.Handler) (events.LambdaFunctionURLResponse, error) {
+			// Perform authentication logic here
+			// For demonstration, we'll just check for a token in the header
+			if token, ok := request.Headers["authorization"]; !ok || token != "Bearer valid-token" {
+				return events.LambdaFunctionURLResponse{
+					StatusCode: router.StatusUnauthorized,
+					Body:       "Unauthorized",
+				}, nil
+			}
+			return next.HandleRequest(ctx, request)
+		},
+		&router.MiddlewareConfig{
+			ExcludedEndpoints: []string{"/hello"},
+			ExcludedMethods:   []string{router.MethodOptions},
+		},
+	)
 }
 
 func helloHandler(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
 	return events.LambdaFunctionURLResponse{
-		StatusCode: http.StatusOK,
+		StatusCode: router.StatusOK,
 		Body:       "Hello, World!",
 	}, nil
 }
 
-func echoHandler(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
+func createUserHandler(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
+	// Process user creation logic here
 	return events.LambdaFunctionURLResponse{
-		StatusCode: http.StatusOK,
-		Body:       request.Body,
+		StatusCode: router.StatusCreated,
+		Body:       "User created successfully",
 	}, nil
 }
 
 func customNotFoundHandler(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
 	return events.LambdaFunctionURLResponse{
-		StatusCode: http.StatusNotFound,
-		Body:       fmt.Sprintf("Custom 404 Not Found: %s", request.RequestContext.HTTP.Path),
+		StatusCode: router.StatusNotFound,
+		Body:       fmt.Sprintf("Custom Not Found: %s", request.RequestContext.HTTP.Path),
 	}, nil
 }
 ```
