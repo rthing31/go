@@ -2,179 +2,186 @@ package router
 
 import (
 	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-lambda-go/events"
 )
 
-// Handler defines the interface for custom handlers
 type Handler interface {
-	HandleRequest(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error)
+	ServeHTTP(context.Context, events.LambdaFunctionURLRequest) Response
 }
 
-// HandlerFunc is a function type that implements the Handler interface
-type HandlerFunc func(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error)
+type HandlerFunc func(context.Context, events.LambdaFunctionURLRequest) Response
 
-// HandleRequest calls f(ctx, request)
-func (f HandlerFunc) HandleRequest(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
-	return f(ctx, request)
+func (f HandlerFunc) ServeHTTP(ctx context.Context, req events.LambdaFunctionURLRequest) Response {
+	return f(ctx, req)
 }
 
-// MiddlewareConfig defines the configuration for middleware exclusions
+type Response struct {
+	StatusCode int               `json:"statusCode"`
+	Headers    map[string]string `json:"headers"`
+	Body       interface{}       `json:"body"`
+}
+
+type MiddlewareFunc func(Handler) Handler
+
 type MiddlewareConfig struct {
-	ExcludedEndpoints []string
-	ExcludedMethods   []string
-	ExcludedHeaders   map[string]string
+	ExcludedRoutes  []string
+	ExcludedMethods []string
+	ExcludedHeaders map[string]string
 }
 
-// Middleware defines the interface for middleware
-type Middleware interface {
-	Process(ctx context.Context, request events.LambdaFunctionURLRequest, next Handler) (events.LambdaFunctionURLResponse, error)
-	Config() *MiddlewareConfig
+type Middleware struct {
+	Func   MiddlewareFunc
+	Config MiddlewareConfig
 }
 
-// MiddlewareFunc is a function type that implements the Middleware interface
-type MiddlewareFunc struct {
-	Func   func(ctx context.Context, request events.LambdaFunctionURLRequest, next Handler) (events.LambdaFunctionURLResponse, error)
-	config *MiddlewareConfig
-}
-
-// Process calls f.Func(ctx, request, next)
-func (f MiddlewareFunc) Process(ctx context.Context, request events.LambdaFunctionURLRequest, next Handler) (events.LambdaFunctionURLResponse, error) {
-	return f.Func(ctx, request, next)
-}
-
-// Config returns the middleware configuration
-func (f MiddlewareFunc) Config() *MiddlewareConfig {
-	return f.config
-}
-
-// NewMiddleware creates a new MiddlewareFunc with the given function and config
-func NewMiddleware(f func(ctx context.Context, request events.LambdaFunctionURLRequest, next Handler) (events.LambdaFunctionURLResponse, error), config *MiddlewareConfig) Middleware {
-	return MiddlewareFunc{Func: f, config: config}
-}
-
-// Router is the main structure for routing
 type Router struct {
 	routes                  map[string]map[string]Handler
 	preMiddleware           []Middleware
 	postMiddleware          []Middleware
 	notFoundHandler         Handler
 	methodNotAllowedHandler Handler
+	panicHandler            func(context.Context, events.LambdaFunctionURLRequest) Response
+	stripTrailingSlash      bool
+	logger                  *log.Logger
 }
 
-// NewRouter initializes a new Router instance
-func NewRouter() *Router {
-	return &Router{
-		routes:                  make(map[string]map[string]Handler),
-		preMiddleware:           []Middleware{},
-		postMiddleware:          []Middleware{},
-		notFoundHandler:         HandlerFunc(defaultNotFoundHandler),
-		methodNotAllowedHandler: HandlerFunc(defaultMethodNotAllowedHandler),
+func NewRouter(logger *log.Logger) *Router {
+	if logger == nil {
+		logger = log.New(os.Stdout, "ROUTER: ", log.Ldate|log.Ltime|log.Lshortfile)
 	}
+	r := &Router{
+		routes:             make(map[string]map[string]Handler),
+		stripTrailingSlash: true,
+		logger:             logger,
+	}
+	r.notFoundHandler = HandlerFunc(defaultNotFoundHandler)
+	r.methodNotAllowedHandler = HandlerFunc(defaultMethodNotAllowedHandler)
+	r.panicHandler = defaultPanicHandler
+	return r
 }
 
-// AddRoute registers a new route with a handler
 func (r *Router) AddRoute(method, path string, handler Handler) {
 	if r.routes[path] == nil {
 		r.routes[path] = make(map[string]Handler)
 	}
-	r.routes[path][strings.ToUpper(method)] = handler
+	r.routes[path][method] = handler
 }
 
-// UsePre adds a pre-route middleware to the router
-func (r *Router) UsePre(mw Middleware) {
-	r.preMiddleware = append(r.preMiddleware, mw)
+func (r *Router) UsePre(mw MiddlewareFunc, config MiddlewareConfig) {
+	r.preMiddleware = append(r.preMiddleware, Middleware{Func: mw, Config: config})
 }
 
-// UsePost adds a post-route middleware to the router
-func (r *Router) UsePost(mw Middleware) {
-	r.postMiddleware = append(r.postMiddleware, mw)
+func (r *Router) UsePost(mw MiddlewareFunc, config MiddlewareConfig) {
+	r.postMiddleware = append(r.postMiddleware, Middleware{Func: mw, Config: config})
 }
 
-// SetNotFoundHandler sets a custom handler for 404 Not Found responses
 func (r *Router) SetNotFoundHandler(handler Handler) {
 	r.notFoundHandler = handler
 }
 
-// SetMethodNotAllowedHandler sets a custom handler for 405 Method Not Allowed responses
 func (r *Router) SetMethodNotAllowedHandler(handler Handler) {
 	r.methodNotAllowedHandler = handler
 }
 
-// HandleRequest routes the incoming request to the appropriate handler
-func (r *Router) HandleRequest(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
-	handler := r.createHandlerChain(r.preMiddleware, HandlerFunc(r.handleRouteRequest))
-	handler = r.createHandlerChain(r.postMiddleware, handler)
-	return handler.HandleRequest(ctx, request)
+func (r *Router) SetPanicHandler(handler func(context.Context, events.LambdaFunctionURLRequest) Response) {
+	r.panicHandler = handler
 }
 
-// handleRouteRequest routes the request to the appropriate handler
-func (r *Router) handleRouteRequest(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
-	if methodHandlers, ok := r.routes[request.RequestContext.HTTP.Path]; ok {
-		if handler, ok := methodHandlers[request.RequestContext.HTTP.Method]; ok {
-			return handler.HandleRequest(ctx, request)
-		}
-		return r.methodNotAllowedHandler.HandleRequest(ctx, request)
-	}
-	return r.notFoundHandler.HandleRequest(ctx, request)
+func (r *Router) SetStripTrailingSlash(strip bool) {
+	r.stripTrailingSlash = strip
 }
 
-// createHandlerChain creates a chain of middleware and handlers, considering exclusions
-func (r *Router) createHandlerChain(middleware []Middleware, finalHandler Handler) Handler {
-	if len(middleware) == 0 {
-		return finalHandler
+func (r *Router) HandleRequest(ctx context.Context, req events.LambdaFunctionURLRequest) Response {
+	startTime := time.Now()
+	var resp Response
+	var err error
+
+	defer func() {
+		duration := time.Since(startTime)
+		if e := recover(); e != nil {
+			err = fmt.Errorf("panic: %v", e)
+			resp = r.panicHandler(ctx, req)
+		}
+		r.logRequestCompletion(req, resp, duration, err)
+	}()
+
+	path := req.RequestContext.HTTP.Path
+	method := req.RequestContext.HTTP.Method
+
+	if r.stripTrailingSlash {
+		path = strings.TrimRight(path, "/")
 	}
 
-	return HandlerFunc(func(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
-		if r.shouldApplyMiddleware(middleware[0], request) {
-			return middleware[0].Process(ctx, request, r.createHandlerChain(middleware[1:], finalHandler))
+	if handlers, ok := r.routes[path]; ok {
+		if handler, ok := handlers[method]; ok {
+			handler = r.applyMiddleware(handler)
+			resp = handler.ServeHTTP(ctx, req)
+			return resp
 		}
-		return r.createHandlerChain(middleware[1:], finalHandler).HandleRequest(ctx, request)
-	})
+		resp = r.methodNotAllowedHandler.ServeHTTP(ctx, req)
+		return resp
+	}
+	resp = r.notFoundHandler.ServeHTTP(ctx, req)
+	return resp
 }
 
-// shouldApplyMiddleware checks if the middleware should be applied based on its configuration
-func (r *Router) shouldApplyMiddleware(mw Middleware, request events.LambdaFunctionURLRequest) bool {
-	config := mw.Config()
-	if config == nil {
-		return true
+func (r *Router) applyMiddleware(handler Handler) Handler {
+	for i := len(r.postMiddleware) - 1; i >= 0; i-- {
+		mw := r.postMiddleware[i]
+		handler = mw.Func(handler)
 	}
 
-	// Check excluded endpoints
-	for _, endpoint := range config.ExcludedEndpoints {
-		if request.RequestContext.HTTP.Path == endpoint {
-			return false
-		}
+	for i := len(r.preMiddleware) - 1; i >= 0; i-- {
+		mw := r.preMiddleware[i]
+		handler = mw.Func(handler)
 	}
 
-	// Check excluded methods
-	for _, method := range config.ExcludedMethods {
-		if request.RequestContext.HTTP.Method == method {
-			return false
-		}
-	}
-
-	// Check excluded headers
-	for header, value := range config.ExcludedHeaders {
-		if headerValue, ok := request.Headers[header]; ok && headerValue == value {
-			return false
-		}
-	}
-
-	return true
+	return handler
 }
 
-func defaultNotFoundHandler(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
-	return events.LambdaFunctionURLResponse{
-		StatusCode: StatusNotFound,
-		Body:       "Not Found",
-	}, nil
+func (r *Router) logRequestCompletion(req events.LambdaFunctionURLRequest, resp Response, duration time.Duration, err error) {
+	logEntry := fmt.Sprintf(
+		"Request completed: method=%s path=%s status=%d duration=%v",
+		req.RequestContext.HTTP.Method,
+		req.RequestContext.HTTP.Path,
+		resp.StatusCode,
+		duration,
+	)
+
+	if err != nil {
+		logEntry += fmt.Sprintf(" error=%v", err)
+	}
+
+	r.logger.Println(logEntry)
 }
 
-func defaultMethodNotAllowedHandler(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
-	return events.LambdaFunctionURLResponse{
-		StatusCode: StatusMethodNotAllowed,
-		Body:       "Method Not Allowed",
-	}, nil
+func defaultNotFoundHandler(ctx context.Context, req events.LambdaFunctionURLRequest) Response {
+	return Response{
+		StatusCode: http.StatusNotFound,
+		Headers:    map[string]string{"Content-Type": "application/json"},
+		Body:       map[string]string{"error": "Not Found"},
+	}
+}
+
+func defaultMethodNotAllowedHandler(ctx context.Context, req events.LambdaFunctionURLRequest) Response {
+	return Response{
+		StatusCode: http.StatusMethodNotAllowed,
+		Headers:    map[string]string{"Content-Type": "application/json"},
+		Body:       map[string]string{"error": "Method Not Allowed"},
+	}
+}
+
+func defaultPanicHandler(ctx context.Context, req events.LambdaFunctionURLRequest) Response {
+	return Response{
+		StatusCode: http.StatusInternalServerError,
+		Headers:    map[string]string{"Content-Type": "application/json"},
+		Body:       map[string]string{"error": "Internal Server Error"},
+	}
 }
